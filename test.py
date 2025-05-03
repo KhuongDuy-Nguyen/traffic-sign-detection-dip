@@ -20,19 +20,39 @@ def get_color_ranges():
         ]
     }
 
-def calculate_pixel_count(hsv, mask, color_ranges):
-    color_counts = {color: 0 for color in color_ranges}
-    for color, ranges in color_ranges.items():
-        color_mask = np.zeros_like(mask)
-        for lower, upper in ranges:
-            color_mask |= cv2.inRange(hsv, lower, upper)
-        color_area = cv2.bitwise_and(mask, color_mask)
-        color_counts[color] = np.sum(color_area > 0)
-    return color_counts
+def check_triangle_colors(hsv, contour, color_ranges):
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, (255), -1)
 
-def calculate_color_ratios(color_counts, total_area):
-    color_ratios = {color: count / total_area for color, count in color_counts.items()}
-    return color_ratios
+    border_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    cv2.drawContours(border_mask, [contour], -1, (255), 2)
+
+    inner_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    eroded_contour = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=2)
+    inner_area = cv2.bitwise_and(mask, eroded_contour)
+
+    red_border_ratio = 0
+    for lower, upper in color_ranges["Red"]:
+        red_mask = cv2.inRange(hsv, lower, upper)
+        red_border = cv2.bitwise_and(red_mask, border_mask)
+        red_border_ratio += np.sum(red_border > 0) / (np.sum(border_mask > 0) + 1e-6)
+
+    yellow_inner_ratio = 0
+    for lower, upper in color_ranges["Yellow"]:
+        yellow_mask = cv2.inRange(hsv, lower, upper)
+        yellow_inner = cv2.bitwise_and(yellow_mask, inner_area)
+        yellow_inner_ratio = np.sum(yellow_inner > 0) / (np.sum(inner_area > 0) + 1e-6)
+
+    return red_border_ratio > 0.05 and yellow_inner_ratio > 0.5
+
+def preprocess_mask(mask, kernel):
+    mask = cv2.GaussianBlur(mask, (9, 9), 0)
+    mask = cv2.medianBlur(mask, 5)
+    mask = cv2.dilate(mask, kernel, iterations=3)
+    mask = cv2.erode(mask, kernel, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
 
 def detect_triangle_shape(contour):
     area = cv2.contourArea(contour)
@@ -73,33 +93,6 @@ def check_position(y, h, frame_height):
         return False
     return True
 
-def analyze_sign_color_and_shape(hsv, contour, color_ranges):
-    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    cv2.drawContours(mask, [contour], -1, (255), -1)
-
-    # Tính toán số lượng pixel của từng màu trong vùng biển báo
-    color_counts = calculate_pixel_count(hsv, mask, color_ranges)
-    total_area = np.sum(mask > 0)
-
-    # Tính tỷ lệ màu trong vùng biển báo
-    color_ratios = calculate_color_ratios(color_counts, total_area)
-
-    # Phân tích hình dạng biển báo
-    if detect_triangle_shape(contour):
-        shape = "Triangle"
-    else:
-        shape = "Other Shape"
-
-    return color_counts, color_ratios, shape
-
-def preprocess_mask(mask, kernel):
-    mask = cv2.GaussianBlur(mask, (9, 9), 0)
-    mask = cv2.medianBlur(mask, 5)
-    mask = cv2.dilate(mask, kernel, iterations=3)
-    mask = cv2.erode(mask, kernel, iterations=3)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    return mask
 def detect_signs(hsv, color_ranges, kernel):
     results = []
     frame_height = hsv.shape[0]
@@ -126,9 +119,7 @@ def detect_signs(hsv, color_ranges, kernel):
             if 0.8 <= ratio <= 1.2:
                 circularity = (4 * np.pi * area) / (cv2.arcLength(contour, True) ** 2)
                 if 0.8 <= circularity <= 1.2:
-                    # Phân tích màu sắc ngay cả khi phát hiện hình tròn
-                    color_counts, color_ratios, shape = analyze_sign_color_and_shape(hsv, contour, color_ranges)
-                    results.append((f"{color} Circle", contour, (x, y, w, h), color_counts, color_ratios, "Circle"))
+                    results.append((f"{color} Circle", contour, (x, y, w, h)))
 
     combined_mask = None
     for color, ranges in [("Yellow", color_ranges["Yellow"]), ("Red", color_ranges["Red"])]:
@@ -145,13 +136,10 @@ def detect_signs(hsv, color_ranges, kernel):
         if not check_position(y, h, frame_height):
             continue
 
-        if detect_triangle_shape(contour):
-            color_counts, color_ratios, shape = analyze_sign_color_and_shape(hsv, contour, color_ranges)
-            results.append(("Warning Sign", contour, (x, y, w, h), color_counts, color_ratios, shape))
+        if detect_triangle_shape(contour) and check_triangle_colors(hsv, contour, color_ranges):
+            results.append(("Warning Sign", contour, (x, y, w, h)))
 
     return results
-
-
 
 def process_video(video_path):
     output_dir = 'video_output'
@@ -181,11 +169,8 @@ def process_video(video_path):
 
         detected_signs = detect_signs(hsv, color_ranges, kernel)
 
-        for label, contour, (x, y, w, h), color_counts, color_ratios, shape in detected_signs:
+        for label, contour, (x, y, w, h) in detected_signs:
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            print(f"Detected {label} at ({x}, {y}) with shape: {shape}")
-            print(f"Color Counts: {color_counts}")
-            print(f"Color Ratios: {color_ratios}")
 
         out.write(frame)
 
