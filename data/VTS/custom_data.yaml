@@ -1,0 +1,36 @@
+train: /content/drive/MyDrive/AI_CAPSTONE_PROJECT/train_data/images/train
+val: /content/drive/MyDrive/AI_CAPSTONE_PROJECT/train_data/images/val
+test: /content/drive/MyDrive/AI_CAPSTONE_PROJECT/train_data/images/test
+
+nc: 29
+# Classes
+names:
+  0: one way prohibition
+  1: no parking
+  2: no stopping and parking
+  3: no turn left
+  4: no turn right
+  5: no u turn
+  6: no u and left turn
+  7: no u and right turn
+  8: no motorbike entry/turning
+  9: no car entry/turning
+  10: no truck entry/turning
+  11: other prohibition
+  12: indication
+  13: direction
+  14: speed limit
+  15: weight limit
+  16: height limit
+  17: pedestrian crossing
+  18: intersection danger
+  19: road danger
+  20: pedestrian danger
+  21: construction danger
+  22: slow warning
+  23: other warning
+  24: vehicle permission lane
+  25: vehicle and speed permission lane
+  26: overpass route
+  27: no more prohibition
+  28: other
