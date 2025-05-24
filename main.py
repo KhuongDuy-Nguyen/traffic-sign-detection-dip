@@ -1,6 +1,10 @@
 import cv2
 import numpy as np
 import os
+import unicodedata
+import re
+
+STANDARD_SIZE = (150, 150)
 
 def get_color_ranges():
     return {
@@ -100,6 +104,7 @@ def preprocess_mask(mask, kernel):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     return mask
+
 def detect_signs(hsv, color_ranges, kernel):
     results = []
     frame_height = hsv.shape[0]
@@ -151,9 +156,115 @@ def detect_signs(hsv, color_ranges, kernel):
 
     return results
 
+def load_templates(template_dir):
+    templates = {}
+    for filename in os.listdir(template_dir):
+        if filename.endswith(('.jpg', '.png')):
+            label = os.path.splitext(filename)[0]
+            img = cv2.imread(os.path.join(template_dir, filename))  # Read in color
+            # img = cv2.resize(img, STANDARD_SIZE)
+            templates[label] = img
+    return templates
 
+def normalize_label(label):
+    label = label.replace('Đ', 'D').replace('đ', 'd')
+    label = unicodedata.normalize('NFD', label)
+    label = ''.join(c for c in label if unicodedata.category(c) != 'Mn')
+    label = re.sub(r"[^a-zA-Z0-9\s]", "", label)
+    label = label.strip().title()
+    return label
 
-def process_video(video_path):
+def load_templates_orb(template_dir, size=STANDARD_SIZE):
+    orb = cv2.ORB_create()
+    templates = {}
+
+    for filename in os.listdir(template_dir):
+        if filename.lower().endswith(('.jpg', '.png')):
+            label = os.path.splitext(filename)[0]
+            img = cv2.imread(os.path.join(template_dir, filename), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+            img_resized = resize_with_padding(img, size)
+            kp, des = orb.detectAndCompute(img_resized, None)
+            templates[label] = (img_resized, kp, des)
+    return templates
+
+def resize_with_padding(img, size=STANDARD_SIZE):
+    h, w = img.shape[:2]
+    scale = min(size[0] / h, size[1] / w)
+    nh, nw = int(h * scale), int(w * scale)
+    resized = cv2.resize(img, (nw, nh))
+
+    top = (size[1] - nh) // 2
+    left = (size[0] - nw) // 2
+
+    if len(img.shape) == 2:
+        # Ảnh grayscale
+        result = np.full((size[1], size[0]), 128, dtype=np.uint8)
+    else:
+        # Ảnh màu
+        result = np.full((size[1], size[0], 3), 128, dtype=np.uint8)
+
+    result[top:top + nh, left:left + nw] = resized
+    return result
+
+def enhance_gray(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+    gray = cv2.equalizeHist(gray)
+    gray = cv2.resize(gray, STANDARD_SIZE)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    sharpened = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
+    
+    return sharpened
+
+def match_sign_with_template(roi_bgr, templates_bgr, templates_orb, score_thresh=0.6):
+    best_match = ("Unknown", 0.0)  # (label, score)
+
+    for label, tmpl in templates_bgr.items():
+        if roi_bgr.shape != tmpl.shape:
+            continue
+
+        result = cv2.matchTemplate(roi_bgr, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, score, _, _ = cv2.minMaxLoc(result)
+
+        if score > best_match[1]:
+            best_match = (label, score)
+
+    if best_match[1] >= score_thresh:
+        print(f"[DEBUG][BGR] Matching {best_match[0]} → score: {best_match[1]:.2f}")
+        return best_match[0]
+
+    # --- Nếu BGR fail, fallback sang ORB ---
+    orb = cv2.ORB_create()
+    roi_gray = enhance_gray(roi_bgr)
+    kp2, des2 = orb.detectAndCompute(roi_gray, None)
+
+    if des2 is None or len(kp2) < 3:
+        return "Unknown"
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    best_match_orb = ("Unknown", float("inf"))
+
+    for label, (tmpl, kp1, des1) in templates_orb.items():
+        if des1 is None or len(kp1) < 3:
+            continue
+
+        matches = bf.match(des1, des2)
+        matches = sorted(matches, key=lambda x: x.distance)
+        if len(matches) == 0:
+            continue
+
+        score = sum(m.distance for m in matches[:10]) / len(matches[:10])
+        if score < best_match_orb[1]:
+            best_match_orb = (label, score)
+
+    if best_match_orb[1] < 60:
+        print(f"[DEBUG][ORB] Matching {best_match_orb[0]} → score: {best_match_orb[1]:.2f}")
+        return best_match_orb[0]
+    else :
+        return "Unknown"
+
+def process_video(video_path, isDebug, isShowScreen):
     output_dir = 'video_output'
     os.makedirs(output_dir, exist_ok=True)
 
@@ -171,6 +282,9 @@ def process_video(video_path):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
+    templates_bgr = load_templates("templates")
+    templates_orb = load_templates_orb("templates")
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -187,23 +301,91 @@ def process_video(video_path):
             print(f"Color Counts: {color_counts}")
             print(f"Color Ratios: {color_ratios}")
 
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            roi = frame[y:y+h, x:x+w]
+            roi = cv2.resize(roi, STANDARD_SIZE)
+
+            if (isDebug == True):
+                cv2.imwrite(f"debug/roi_{x}_{y}.jpg", roi)
+
+        
+            matched_label = match_sign_with_template(roi, templates_bgr, templates_orb, 0.40)
+            print("Match: ", matched_label)
+
+            cv2.putText(frame, matched_label, (x + w + 10, y + h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
         out.write(frame)
 
-        cv2.imshow('Traffic Sign Detection', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        if (isShowScreen == True):
+            cv2.imshow('Traffic Sign Detection', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
     cap.release()
     out.release()
     cv2.destroyAllWindows()
 
+def generateTemplate(image_dirs, label_dirs, classes_dirs):
+    output_dir = "templates"
+    os.makedirs(output_dir, exist_ok=True)
+
+    for image_dir, label_dir, classes_dir in zip(image_dirs, label_dirs, classes_dirs):
+        print(f"Start generate for {classes_dir} - {image_dir} - {label_dir}")
+
+        class_names = open(classes_dir).read().splitlines()
+        for label_file in os.listdir(label_dir):
+            if not label_file.endswith(".txt"):
+                continue
+
+            filename_base = label_file.replace(".txt", "")
+            image_file_jpg = os.path.join(image_dir, filename_base + ".jpg")
+            image_file_png = os.path.join(image_dir, filename_base + ".png")
+
+            if os.path.exists(image_file_jpg):
+                image_file = image_file_jpg
+            elif os.path.exists(image_file_png):
+                image_file = image_file_png
+            else:
+                continue
+
+            img = cv2.imread(image_file)
+            h, w = img.shape[:2]
+
+            with open(os.path.join(label_dir, label_file), "r") as f:
+                for idx, line in enumerate(f):
+                    class_id, cx, cy, bw, bh = map(float, line.strip().split())
+                    x = int((cx - bw / 2) * w)
+                    y = int((cy - bh / 2) * h)
+                    bw = int(bw * w)
+                    bh = int(bh * h)
+
+                    cropped = img[y:y+bh, x:x+bw]
+                    # if cropped.size == 0:
+                    #     continue
+
+                    cropped = cv2.resize(cropped, STANDARD_SIZE)
+                    
+                    class_name = normalize_label(class_names[int(class_id)])
+                    output_path = os.path.join(output_dir, f"{class_name}_{idx}.jpg")
+                    cv2.imwrite(output_path, cropped)         
+        
+        print(f"Generate template for {classes_dir} - DONE")
+
 def main():
     video_dir = 'video'
+
+    image_dirs = ['data/images', 'data/VTS/images/train']
+    label_dirs = ['data/labels', 'data/VTS/labels/train']
+    classes_dirs = ['data/classes_en.txt', 'data/VTS/classes.txt']
+
+    generateTemplate(image_dirs, label_dirs, classes_dirs)
+
     for video_file in os.listdir(video_dir):
         if video_file.endswith('.mp4'):
             video_path = os.path.join(video_dir, video_file)
             print(f'Processing {video_file}...')
-            process_video(video_path)
+            process_video(video_path, False, False)
+            print(f'Success {video_file}...')
 
 if __name__ == "__main__":
     main()

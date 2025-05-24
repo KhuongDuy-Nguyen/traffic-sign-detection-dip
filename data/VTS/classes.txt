@@ -1,0 +1,29 @@
+one way prohibition
+no parking
+no stopping and parking
+no turn left
+no turn right
+no u turn
+no u and left turn
+no u and right turn
+no motorbike entry/turning
+no car entry/turning
+no truck entry/turning
+other prohibition
+indication
+direction
+speed limit
+weight limit
+height limit
+pedestrian crossing
+intersection danger
+road danger
+pedestrian danger
+construction danger
+slow warning
+other warning
+vehicle permission lane
+vehicle and speed permission lane
+overpass route
+no more prohibition
+other
