@@ -1,9 +1,18 @@
+# %% [markdown]
+# ### Import libraries
+
+# %%
 import cv2
 import numpy as np
 import os
+
 import unicodedata
 import re
 
+# %% [markdown]
+# ### Functions
+
+# %%
 STANDARD_SIZE = (150, 150)
 
 def get_color_ranges():
@@ -24,19 +33,39 @@ def get_color_ranges():
         ]
     }
 
-def calculate_pixel_count(hsv, mask, color_ranges):
-    color_counts = {color: 0 for color in color_ranges}
-    for color, ranges in color_ranges.items():
-        color_mask = np.zeros_like(mask)
-        for lower, upper in ranges:
-            color_mask |= cv2.inRange(hsv, lower, upper)
-        color_area = cv2.bitwise_and(mask, color_mask)
-        color_counts[color] = np.sum(color_area > 0)
-    return color_counts
+def check_triangle_colors(hsv, contour, color_ranges):
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, (255), -1)
 
-def calculate_color_ratios(color_counts, total_area):
-    color_ratios = {color: count / total_area for color, count in color_counts.items()}
-    return color_ratios
+    border_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    cv2.drawContours(border_mask, [contour], -1, (255), 2)
+
+    inner_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    eroded_contour = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=2)
+    inner_area = cv2.bitwise_and(mask, eroded_contour)
+
+    red_border_ratio = 0
+    for lower, upper in color_ranges["Red"]:
+        red_mask = cv2.inRange(hsv, lower, upper)
+        red_border = cv2.bitwise_and(red_mask, border_mask)
+        red_border_ratio += np.sum(red_border > 0) / (np.sum(border_mask > 0) + 1e-6)
+
+    yellow_inner_ratio = 0
+    for lower, upper in color_ranges["Yellow"]:
+        yellow_mask = cv2.inRange(hsv, lower, upper)
+        yellow_inner = cv2.bitwise_and(yellow_mask, inner_area)
+        yellow_inner_ratio = np.sum(yellow_inner > 0) / (np.sum(inner_area > 0) + 1e-6)
+
+    return red_border_ratio > 0.05 and yellow_inner_ratio > 0.5
+
+def preprocess_mask(mask, kernel):
+    mask = cv2.GaussianBlur(mask, (9, 9), 0)
+    mask = cv2.medianBlur(mask, 5)
+    mask = cv2.dilate(mask, kernel, iterations=3)
+    mask = cv2.erode(mask, kernel, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
 
 def detect_triangle_shape(contour):
     area = cv2.contourArea(contour)
@@ -131,9 +160,7 @@ def detect_signs(hsv, color_ranges, kernel):
             if 0.8 <= ratio <= 1.2:
                 circularity = (4 * np.pi * area) / (cv2.arcLength(contour, True) ** 2)
                 if 0.8 <= circularity <= 1.2:
-                    # Phân tích màu sắc ngay cả khi phát hiện hình tròn
-                    color_counts, color_ratios, shape = analyze_sign_color_and_shape(hsv, contour, color_ranges)
-                    results.append((f"{color} Circle", contour, (x, y, w, h), color_counts, color_ratios, "Circle"))
+                    results.append((f"{color} Circle", contour, (x, y, w, h)))
 
     combined_mask = None
     for color, ranges in [("Yellow", color_ranges["Yellow"]), ("Red", color_ranges["Red"])]:
@@ -150,9 +177,8 @@ def detect_signs(hsv, color_ranges, kernel):
         if not check_position(y, h, frame_height):
             continue
 
-        if detect_triangle_shape(contour):
-            color_counts, color_ratios, shape = analyze_sign_color_and_shape(hsv, contour, color_ranges)
-            results.append(("Warning Sign", contour, (x, y, w, h), color_counts, color_ratios, shape))
+        if detect_triangle_shape(contour) and check_triangle_colors(hsv, contour, color_ranges):
+            results.append(("Warning Sign", contour, (x, y, w, h)))
 
     return results
 
@@ -217,34 +243,10 @@ def enhance_gray(img):
     
     return sharpened
 
-def match_sign_with_template(roi_bgr, templates_bgr, templates_orb, score_thresh=0.6):
-    best_match = ("Unknown", 0.0)  # (label, score)
-
-    for label, tmpl in templates_bgr.items():
-        if roi_bgr.shape != tmpl.shape:
-            continue
-
-        result = cv2.matchTemplate(roi_bgr, tmpl, cv2.TM_CCOEFF_NORMED)
-        _, score, _, _ = cv2.minMaxLoc(result)
-
-        if score > best_match[1]:
-            best_match = (label, score)
-
-    if best_match[1] >= score_thresh:
-        print(f"[DEBUG][BGR] Matching {best_match[0]} → score: {best_match[1]:.2f}")
-        return best_match[0]
-
-    # --- Nếu BGR fail, fallback sang ORB ---
-    orb = cv2.ORB_create()
-    roi_gray = enhance_gray(roi_bgr)
-    kp2, des2 = orb.detectAndCompute(roi_gray, None)
-
-    if des2 is None or len(kp2) < 3:
-        return "Unknown"
-
+def orb_match(des2, templates_orb, score_orb):
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     best_match_orb = ("Unknown", float("inf"))
-
+    
     for label, (tmpl, kp1, des1) in templates_orb.items():
         if des1 is None or len(kp1) < 3:
             continue
@@ -258,13 +260,112 @@ def match_sign_with_template(roi_bgr, templates_bgr, templates_orb, score_thresh
         if score < best_match_orb[1]:
             best_match_orb = (label, score)
 
-    if best_match_orb[1] < 60:
+    if best_match_orb[1] < score_orb:
         print(f"[DEBUG][ORB] Matching {best_match_orb[0]} → score: {best_match_orb[1]:.2f}")
         return best_match_orb[0]
-    else :
+    else:
+        return "Unknown"
+    
+def bgr_match(roi_bgr, templates_bgr, score_bgr):
+    best_match = ("Unknown", 0.0)
+    for label, tmpl in templates_bgr.items():
+        if roi_bgr.shape != tmpl.shape:
+            continue
+
+        result = cv2.matchTemplate(roi_bgr, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, score, _, _ = cv2.minMaxLoc(result)
+
+        if score > best_match[1]:
+            best_match = (label, score)
+
+    if best_match[1] >= score_bgr:
+        print(f"[DEBUG][BGR] Matching {best_match[0]} → score: {best_match[1]:.2f}")
+        return best_match[0]
+    else:
         return "Unknown"
 
-def process_video(video_path, isDebug, isShowScreen):
+
+def match_sign_with_template(roi_bgr, templates_bgr, templates_orb, score_orb, score_bgr):    
+    orb = cv2.ORB_create()
+    roi_gray = enhance_gray(roi_bgr)
+    kp2, des2 = orb.detectAndCompute(roi_gray, None)
+
+    if des2 is None or len(kp2) < 3:
+        return "Unknown"
+    
+    if bgr_match(roi_bgr, templates_bgr, score_bgr) != "Unknown":
+        return bgr_match(roi_bgr, templates_bgr, score_bgr)
+    else:
+        return orb_match(des2, templates_orb, score_orb)
+
+    
+
+
+# %% [markdown]
+# ### Create template
+
+# %%
+import os
+import cv2
+
+image_dirs = ["data/images", "data/VTS/images/train"]
+label_dirs = ["data/labels", "data/VTS/labels/train"]
+classes_dirs = ["data/classes_en.txt", "data/VTS/classes.txt"]
+output_dir = "templates"
+
+
+os.makedirs(output_dir, exist_ok=True)
+
+for image_dir, label_dir, classes_dir in zip(image_dirs, label_dirs, classes_dirs):
+    print(f"Start generate for {classes_dir} - {image_dir} - {label_dir}")
+
+    class_names = open(classes_dir).read().splitlines()
+
+    for label_file in os.listdir(label_dir):
+        if not label_file.endswith(".txt"):
+            continue
+
+        filename_base = label_file.replace(".txt", "")
+        image_file_jpg = os.path.join(image_dir, filename_base + ".jpg")
+        image_file_png = os.path.join(image_dir, filename_base + ".png")
+
+        if os.path.exists(image_file_jpg):
+            image_file = image_file_jpg
+        elif os.path.exists(image_file_png):
+            image_file = image_file_png
+        else:
+            continue
+
+        img = cv2.imread(image_file)
+        h, w = img.shape[:2]
+
+        with open(os.path.join(label_dir, label_file), "r") as f:
+            for idx, line in enumerate(f):
+                class_id, cx, cy, bw, bh = map(float, line.strip().split())
+                x = int((cx - bw / 2) * w)
+                y = int((cy - bh / 2) * h)
+                bw = int(bw * w)
+                bh = int(bh * h)
+
+                cropped = img[y:y+bh, x:x+bw]
+                # if cropped.size == 0:
+                #     continue
+
+                cropped = cv2.resize(cropped, STANDARD_SIZE)
+                
+                class_name = normalize_label(class_names[int(class_id)])
+                output_path = os.path.join(output_dir, f"{class_name}_{idx}.jpg")
+                cv2.imwrite(output_path, cropped)
+                
+    print(f"Generate template for {classes_dir} - DONE")
+    
+
+
+# %% [markdown]
+# ### Process and run application
+
+# %%
+def process_video(video_path, isDebug, isShowScreen, isSaveFrame, frame_rate=1):
     output_dir = 'video_output'
     os.makedirs(output_dir, exist_ok=True)
 
@@ -284,38 +385,53 @@ def process_video(video_path, isDebug, isShowScreen):
 
     templates_bgr = load_templates("templates")
     templates_orb = load_templates_orb("templates")
+    
+    frame_index = 0
+    os.makedirs("output_frames", exist_ok=True)
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
         frame = cv2.resize(frame, (frame_width, frame_height))
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
         detected_signs = detect_signs(hsv, color_ranges, kernel)
-
-        for label, contour, (x, y, w, h), color_counts, color_ratios, shape in detected_signs:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            print(f"Detected {label} at ({x}, {y}) with shape: {shape}")
-            print(f"Color Counts: {color_counts}")
-            print(f"Color Ratios: {color_ratios}")
-
+        for label, contour, (x, y, w, h) in detected_signs:
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             roi = frame[y:y+h, x:x+w]
             roi = cv2.resize(roi, STANDARD_SIZE)
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+            # Tạo mask theo màu vàng
+            yellow_mask = cv2.inRange(hsv, np.array([20, 80, 80]), np.array([40, 255, 255]))
+
+            # Làm dày mask bằng morphology để lấp pixel rời
+            kernel = np.ones((3, 3), np.uint8)
+            yellow_mask = cv2.dilate(yellow_mask, kernel, iterations=2)
+
+            # Áp dụng inpainting
+            roi = cv2.inpaint(roi, yellow_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
 
             if (isDebug == True):
                 cv2.imwrite(f"debug/roi_{x}_{y}.jpg", roi)
 
+            matched_label = match_sign_with_template(roi, templates_bgr, templates_orb, 40, 0.45)
+            cv2.putText(frame, matched_label, (x, y + h + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
-            matched_label = match_sign_with_template(roi, templates_bgr, templates_orb, 0.40)
-            print("Match: ", matched_label)
-
-            cv2.putText(frame, matched_label, (x + w + 10, y + h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        # Lưu frame
+        timestamp_seconds = int(frame_index / fps)
+        minutes = timestamp_seconds // 60
+        seconds = timestamp_seconds % 60
+        timestamp_str = f"{minutes:02d}-{seconds:02d}"
+        file_name = os.path.splitext(video_filename)[0]
+        save_path = f"output_frames/{file_name}_{timestamp_str}_frame_{frame_index}.jpg"
+        cv2.imwrite(save_path, frame)
+        
+        frame_index += 1
 
         out.write(frame)
 
+        # Show screen
         if (isShowScreen == True):
             cv2.imshow('Traffic Sign Detection', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -325,67 +441,14 @@ def process_video(video_path, isDebug, isShowScreen):
     out.release()
     cv2.destroyAllWindows()
 
-def generateTemplate(image_dirs, label_dirs, classes_dirs):
-    output_dir = "templates"
-    os.makedirs(output_dir, exist_ok=True)
-
-    for image_dir, label_dir, classes_dir in zip(image_dirs, label_dirs, classes_dirs):
-        print(f"Start generate for {classes_dir} - {image_dir} - {label_dir}")
-
-        class_names = open(classes_dir).read().splitlines()
-        for label_file in os.listdir(label_dir):
-            if not label_file.endswith(".txt"):
-                continue
-
-            filename_base = label_file.replace(".txt", "")
-            image_file_jpg = os.path.join(image_dir, filename_base + ".jpg")
-            image_file_png = os.path.join(image_dir, filename_base + ".png")
-
-            if os.path.exists(image_file_jpg):
-                image_file = image_file_jpg
-            elif os.path.exists(image_file_png):
-                image_file = image_file_png
-            else:
-                continue
-
-            img = cv2.imread(image_file)
-            h, w = img.shape[:2]
-
-            with open(os.path.join(label_dir, label_file), "r") as f:
-                for idx, line in enumerate(f):
-                    class_id, cx, cy, bw, bh = map(float, line.strip().split())
-                    x = int((cx - bw / 2) * w)
-                    y = int((cy - bh / 2) * h)
-                    bw = int(bw * w)
-                    bh = int(bh * h)
-
-                    cropped = img[y:y+bh, x:x+bw]
-                    # if cropped.size == 0:
-                    #     continue
-
-                    cropped = cv2.resize(cropped, STANDARD_SIZE)
-                    
-                    class_name = normalize_label(class_names[int(class_id)])
-                    output_path = os.path.join(output_dir, f"{class_name}_{idx}.jpg")
-                    cv2.imwrite(output_path, cropped)         
+# %%
+video_dir = 'video'
+for video_file in os.listdir(video_dir):
+    if video_file.endswith('.mp4'):
+        video_path = os.path.join(video_dir, video_file)
+        print(f'Processing {video_file}...')
+        process_video(video_path, True, False, True, 1)
+        print(f'Success {video_file}...')
         
-        print(f"Generate template for {classes_dir} - DONE")
 
-def main():
-    video_dir = 'video'
 
-    image_dirs = ['data/images', 'data/VTS/images/train']
-    label_dirs = ['data/labels', 'data/VTS/labels/train']
-    classes_dirs = ['data/classes_en.txt', 'data/VTS/classes.txt']
-
-    generateTemplate(image_dirs, label_dirs, classes_dirs)
-
-    for video_file in os.listdir(video_dir):
-        if video_file.endswith('.mp4'):
-            video_path = os.path.join(video_dir, video_file)
-            print(f'Processing {video_file}...')
-            process_video(video_path, False, False)
-            print(f'Success {video_file}...')
-
-if __name__ == "__main__":
-    main()
